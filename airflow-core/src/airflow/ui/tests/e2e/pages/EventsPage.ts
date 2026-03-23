@@ -156,9 +156,9 @@ export class EventsPage extends BasePage {
     const eventCell = await this.getCellByColumnName(firstRow, "Event");
     const userCell = await this.getCellByColumnName(firstRow, "User");
 
-    await expect(whenCell).toHaveText(/.+/);
-    await expect(eventCell).toHaveText(/.+/);
-    await expect(userCell).toHaveText(/.+/);
+    await expect(whenCell).toHaveText(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+    await expect(eventCell).toHaveText(/[a-z][_a-z]*/);
+    await expect(userCell).toHaveText(/\w+/);
   }
 
   public async verifyTableColumns(): Promise<void> {
