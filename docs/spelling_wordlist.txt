@@ -1355,6 +1355,7 @@ responder
 reStructuredText
 resultset
 resumable
+retryable
 Reusability
 rfc
 rmse
@@ -1587,6 +1588,7 @@ sudo
 sudoers
 summarization
 superclass
+superset
 sur
 svg
 symlink
