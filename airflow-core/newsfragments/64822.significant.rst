@@ -1,0 +1,1 @@
+Add ``DagAccessEntity.RUN``, ``DagAccessEntity.HITL_DETAIL``, ``DagAccessEntity.TASK_INSTANCE`` as ``requires_access_dag`` dependencies of the ``/dags`` endpoint because it returns data from multiple entities in response
