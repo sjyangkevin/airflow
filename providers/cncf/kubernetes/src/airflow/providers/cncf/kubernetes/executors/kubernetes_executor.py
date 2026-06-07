@@ -72,7 +72,10 @@ if TYPE_CHECKING:
     from airflow.executors import workloads
     from airflow.models.taskinstance import TaskInstance
     from airflow.models.taskinstancekey import TaskInstanceKey
-    from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_types import WorkloadKey
+    from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_types import (
+        WorkloadCommand,
+        WorkloadKey,
+    )
     from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils import (
         AirflowKubernetesScheduler,
     )
@@ -321,7 +324,7 @@ class KubernetesExecutor(BaseExecutor):
     def execute_async(
         self,
         key: WorkloadKey,
-        command: Any,
+        command: WorkloadCommand,
         queue: str | None = None,
         executor_config: Any | None = None,
     ) -> None:
