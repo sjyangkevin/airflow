@@ -54,7 +54,7 @@ from airflow.providers.cncf.kubernetes.kube_config import KubeConfig
 from airflow.providers.cncf.kubernetes.kubernetes_helper_functions import annotations_to_key
 from airflow.providers.cncf.kubernetes.pod_generator import PodGenerator
 from airflow.providers.cncf.kubernetes.version_compat import AIRFLOW_V_3_0_PLUS, AIRFLOW_V_3_3_PLUS
-from airflow.providers.common.compat.sdk import Stats, conf
+from airflow.providers.common.compat.sdk import Stats, conf, timezone
 from airflow.utils.helpers import prune_dict
 from airflow.utils.log.logging_mixin import remove_escape_codes
 from airflow.utils.session import NEW_SESSION, provide_session
@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from airflow.executors import workloads
     from airflow.models.taskinstance import TaskInstance
     from airflow.models.taskinstancekey import TaskInstanceKey
+    from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_types import WorkloadKey
     from airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils import (
         AirflowKubernetesScheduler,
     )
@@ -89,6 +90,19 @@ class _PodLaunchAttempt:
     job: KubernetesJob
     attempts: int = 0
     requeued_for_pod: str | None = None
+
+
+def _format_workload_key_for_log(key: WorkloadKey) -> str:
+    from airflow.models.taskinstancekey import TaskInstanceKey
+
+    if isinstance(key, TaskInstanceKey):
+        return f"{key.dag_id}.{key.task_id}.{key.try_number}"
+    if AIRFLOW_V_3_3_PLUS:
+        from airflow.models.callback import CallbackKey
+
+        if isinstance(key, CallbackKey):
+            return f"callback:{key.id}"
+    return str(key)
 
 
 class KubernetesExecutor(BaseExecutor):
@@ -135,7 +149,7 @@ class KubernetesExecutor(BaseExecutor):
         self.scheduler_job_id: str | None = None
         self._last_completed_pod_adoption = 0.0
         self.kubernetes_queue: str | None = None
-        self.task_publish_retries: Counter[TaskInstanceKey] = Counter()
+        self.task_publish_retries: Counter[WorkloadKey] = Counter()
         self.task_publish_max_retries = self.conf.getint(
             "kubernetes_executor", "task_publish_max_retries", fallback=0
         )
@@ -306,7 +320,7 @@ class KubernetesExecutor(BaseExecutor):
 
     def execute_async(
         self,
-        key: TaskInstanceKey,
+        key: WorkloadKey,
         command: Any,
         queue: str | None = None,
         executor_config: Any | None = None,
@@ -371,28 +385,30 @@ class KubernetesExecutor(BaseExecutor):
             return
         raise RuntimeError(f"{type(self)} cannot handle workloads of type {type(workload)}")
 
-    def _process_workloads(self, workloads: Sequence[workloads.All]) -> None:
+    def _process_workloads(self, workload_items: Sequence[workloads.All]) -> None:
         from airflow.executors.workloads import ExecuteTask
 
         if AIRFLOW_V_3_3_PLUS:
             from airflow.executors.workloads import ExecuteCallback
 
-        for workload in workloads:
+        for workload in workload_items:
             if isinstance(workload, ExecuteTask):
                 # TODO: AIP-72 handle populating tokens once https://github.com/apache/airflow/issues/45107 is handled.
                 command = [workload]
-                key = workload.ti.key
+                task_key = workload.ti.key
                 queue = workload.ti.queue
                 executor_config = workload.ti.executor_config or {}
 
-                del self.queued_tasks[key]
-                self.execute_async(key=key, command=command, queue=queue, executor_config=executor_config)
-                self.running.add(key)
+                del self.queued_tasks[task_key]
+                self.execute_async(
+                    key=task_key, command=command, queue=queue, executor_config=executor_config
+                )
+                self.running.add(task_key)
             elif AIRFLOW_V_3_3_PLUS and isinstance(workload, ExecuteCallback):
-                key = workload.callback.key
-                del self.queued_callbacks[key]
-                self.execute_async(key=key, command=[workload], queue=None, executor_config=None)
-                self.running.add(key)
+                callback_key = workload.callback.key
+                del self.queued_callbacks[callback_key]
+                self.execute_async(key=callback_key, command=[workload], queue=None, executor_config=None)
+                self.running.add(callback_key)
             else:
                 raise RuntimeError(f"{type(self)} cannot handle workloads of type {type(workload)}")
 
@@ -580,11 +596,7 @@ class KubernetesExecutor(BaseExecutor):
 
                 termination_reason = f"Pod failed because of {pod_reason}"
 
-                task_key_str = (
-                    f"callback:{key.id}"
-                    if not hasattr(key, "dag_id")
-                    else f"{key.dag_id}.{key.task_id}.{key.try_number}"
-                )
+                task_key_str = _format_workload_key_for_log(key)
                 self.log.warning(
                     "Task %s failed in pod %s/%s. Pod phase: %s, reason: %s, message: %s, "
                     "container_type: %s, container_name: %s, container_state: %s, container_reason: %s, "
@@ -603,11 +615,7 @@ class KubernetesExecutor(BaseExecutor):
                     exit_code,
                 )
             else:
-                task_key_str = (
-                    f"callback:{key.id}"
-                    if not hasattr(key, "dag_id")
-                    else f"{key.dag_id}.{key.task_id}.{key.try_number}"
-                )
+                task_key_str = _format_workload_key_for_log(key)
                 self.log.warning(
                     "Task %s failed in pod %s/%s (no details available)", task_key_str, namespace, pod_name
                 )
@@ -696,12 +704,16 @@ class KubernetesExecutor(BaseExecutor):
         # If we don't have a TI state, look it up from the db. event_buffer expects the TI state.
         # For callback keys there is no TaskInstance row — treat state=None as success directly.
         if state is None:
-            if AIRFLOW_V_3_3_PLUS and not hasattr(key, "dag_id"):
+            from airflow.models.taskinstancekey import TaskInstanceKey
+
+            if isinstance(key, TaskInstanceKey):
+                state = self._get_task_instance_state(key, session=session)
+            elif AIRFLOW_V_3_3_PLUS:
                 from airflow.utils.state import CallbackState
 
                 state = CallbackState.SUCCESS
             else:
-                state = self._get_task_instance_state(key, session=session)
+                raise ValueError(f"Unsupported Kubernetes workload key: {key!r}")
 
         self.event_buffer[key] = state, termination_reason
 
@@ -964,7 +976,6 @@ class KubernetesExecutor(BaseExecutor):
             from sqlalchemy import select
 
             from airflow.jobs.job import Job
-            from airflow.utils import timezone
             from airflow.utils.session import create_session
             from airflow.utils.state import JobState
 
