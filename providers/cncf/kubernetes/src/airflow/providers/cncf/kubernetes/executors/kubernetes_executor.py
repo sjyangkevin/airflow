@@ -374,6 +374,7 @@ class KubernetesExecutor(BaseExecutor):
         self.pod_launch_attempts[key] = _PodLaunchAttempt(job=job)
         self.task_queue.put(job)
 
+    # TODO: Remove this once the minimum supported version is 3.3+, and defer to BaseExecutor.queue_workload.
     def queue_workload(self, workload: workloads.All, session: Session | None) -> None:
         from airflow.executors import workloads
 
