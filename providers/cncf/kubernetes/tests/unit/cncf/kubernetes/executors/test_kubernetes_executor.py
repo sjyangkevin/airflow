@@ -3596,6 +3596,83 @@ class TestKubernetesExecutorCallbackSupport:
 
     @pytest.mark.db_test
     @mock.patch(
+        "airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils.AirflowKubernetesScheduler.delete_pod"
+    )
+    def test_change_state_callback_failed_with_launch_attempt_skips_ti_lookup(self, mock_delete_pod):
+        """A failed callback that carries a recorded pod-launch attempt must not enter the
+        task-only pre-execution-failure requeue path, which looks a TaskInstance up by key.
+
+        Regression for the ``'CallbackKey' object has no attribute 'dag_id'`` AttributeError:
+        ``execute_async`` records a ``pod_launch_attempts`` entry for callbacks too, so with the
+        default ``pod_launch_failure_retries=1`` the requeue branch used to call
+        ``_get_task_instance_state(CallbackKey)`` and raise, hanging the scheduler.
+        """
+        from airflow.models.callback import CallbackKey
+
+        executor = self.executor
+        executor.kube_config.delete_worker_pods_on_failure = True
+        executor.pod_launch_failure_max_retries = 1
+        executor.start()
+        try:
+            key = CallbackKey(id=self._CALLBACK_ID)
+            job = KubernetesJob(key, [self._make_callback_workload()], None, None)
+            executor.running = {key}
+            executor.pod_launch_attempts = {key: _PodLaunchAttempt(job=job)}
+            results = KubernetesResults(
+                key,
+                TaskInstanceState.FAILED,
+                "pod_name",
+                "default",
+                "rv",
+                {"container_reason": "Error", "exit_code": 1},
+            )
+            with mock.patch.object(executor, "_get_task_instance_state") as mock_lookup:
+                executor._change_state(results)
+                mock_lookup.assert_not_called()
+            assert executor.event_buffer[key][0] == TaskInstanceState.FAILED
+            assert key not in executor.running
+            assert key not in executor.pod_launch_attempts
+        finally:
+            executor.end()
+
+    def test_sync_defers_requeue_of_failing_result_until_after_drain(self):
+        """A result whose ``_change_state`` raises must be re-queued only after the drain loop
+        finishes, never re-fed into the same loop.
+
+        Re-putting inside the loop lets a permanently-failing result be fetched again
+        immediately, spinning ``sync()`` forever and blocking the scheduler heartbeat. With the
+        fix a failing result is attempted once per ``sync()`` and deferred to the next heartbeat.
+        """
+        from queue import Queue
+
+        from airflow.models.callback import CallbackKey
+
+        executor = self.executor
+        executor.start()
+        try:
+            key = CallbackKey(id=self._CALLBACK_ID)
+            results = KubernetesResults(key, TaskInstanceState.FAILED, "pod_name", "default", "rv", None)
+
+            executor.result_queue = Queue()
+            executor.result_queue.put(results)
+
+            # Raise on the first attempt, succeed on the second. Pre-fix, the result is re-put
+            # inside the loop and reprocessed in the SAME sync() (2 calls); with the fix it is
+            # deferred to the next heartbeat (1 call this cycle).
+            with mock.patch.object(
+                executor, "_change_state", side_effect=[RuntimeError("boom"), None]
+            ) as mock_change_state:
+                executor.sync()
+
+            assert mock_change_state.call_count == 1
+            requeued = executor.result_queue.get_nowait()
+            executor.result_queue.task_done()
+            assert requeued is results
+        finally:
+            executor.end()
+
+    @pytest.mark.db_test
+    @mock.patch(
         "airflow.providers.cncf.kubernetes.executors.kubernetes_executor_utils.AirflowKubernetesScheduler.patch_pod_executor_done"
     )
     def test_change_state_callback_pod_not_deleted_if_keep_pods(self, mock_patch_pod):

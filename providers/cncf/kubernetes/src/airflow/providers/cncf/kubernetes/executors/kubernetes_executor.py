@@ -439,6 +439,7 @@ class KubernetesExecutor(BaseExecutor):
         self.kube_scheduler.sync()
 
         last_resource_version: dict[str, str] = defaultdict(lambda: "0")
+        results_to_requeue: list[KubernetesResults] = []
         with contextlib.suppress(Empty):
             while True:
                 results = self.result_queue.get_nowait()
@@ -454,9 +455,15 @@ class KubernetesExecutor(BaseExecutor):
                             results,
                             results.state,
                         )
-                        self.result_queue.put(results)
+                        # Defer the re-queue until the queue has drained. Putting the result
+                        # back inside this loop lets a permanently-failing result be fetched
+                        # again immediately, spinning sync() forever and blocking the scheduler
+                        # heartbeat; deferring it retries once per heartbeat instead.
+                        results_to_requeue.append(results)
                 finally:
                     self.result_queue.task_done()
+        for results in results_to_requeue:
+            self.result_queue.put(results)
 
         if self.completed:
             still_pending: dict[tuple[str, str], KubernetesResults] = {}
@@ -651,11 +658,17 @@ class KubernetesExecutor(BaseExecutor):
             self.kube_scheduler.patch_pod_executor_done(pod_name=pod_name, namespace=namespace)
             self.log.info("Patched pod %s in namespace %s to mark it as done", key, namespace)
 
-        # Only pods this executor launched and is still tracking can be requeued; checking the
-        # in-memory attempt first avoids a metadata-db lookup for adopted or already-finalized pods.
+        from airflow.models.taskinstancekey import TaskInstanceKey
+
+        # Only task pods this executor launched can be requeued; checking the in-memory attempt
+        # first avoids a metadata-db lookup for adopted or already-finalized pods. The
+        # pre-execution-failure path looks up a TaskInstance and consumes a task retry, neither
+        # of which applies to callback workloads — a CallbackKey has no TaskInstance row, so the
+        # isinstance guard must short-circuit before _get_task_instance_state is evaluated.
         attempt = self.pod_launch_attempts.get(key)
         if (
-            attempt is not None
+            isinstance(key, TaskInstanceKey)
+            and attempt is not None
             and state == TaskInstanceState.FAILED
             and self.pod_launch_failure_max_retries != 0
             and self._is_pre_execution_failure(
