@@ -173,7 +173,7 @@ class KubernetesExecutor(BaseExecutor):
         # adopted pod has no entry here, so a pre-execution failure falls through to a normal fail
         # instead of requeuing. The orphaned task instance itself is still recovered by the
         # scheduler's adopt_or_reset_orphaned_tasks(), which re-queues it with a fresh attempt.
-        self.pod_launch_attempts: dict[TaskInstanceKey, _PodLaunchAttempt] = {}
+        self.pod_launch_attempts: dict[WorkloadKey, _PodLaunchAttempt] = {}
         self.completed: dict[tuple[str, str], KubernetesResults] = {}
         self.create_pods_after: datetime | None = None
 
